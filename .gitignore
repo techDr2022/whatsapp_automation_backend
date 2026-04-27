@@ -1,4 +1,7 @@
 auth_info_baileys/
 .env
+node_modules/
+dist/
+*.log
 
 prd.md

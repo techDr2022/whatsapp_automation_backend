@@ -7,6 +7,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import QRCode from "qrcode";
+import { rm } from "node:fs/promises";
 import { supabase } from "../lib/supabase";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,6 +38,8 @@ export interface WAStatus {
 let socket: WASocket | null = null;
 let waStatus: WAStatus = { status: "disconnected", qrDataUrl: null, account: null };
 let reconnectAttempts = 0;
+let isInitialising = false;
+let isManualLogoutInProgress = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -60,12 +63,56 @@ export function getWAStatus(): WAStatus {
   return { ...waStatus };
 }
 
+/** Starts (or resumes) the WhatsApp login flow and returns current status. */
+export async function startWhatsAppLogin(): Promise<WAStatus> {
+  if (!socket || waStatus.status === "disconnected") {
+    await initWhatsApp();
+  }
+  return getWAStatus();
+}
+
+/**
+ * Logs out and clears local auth state so a new number can be linked.
+ * A fresh login can then be started via startWhatsAppLogin().
+ */
+export async function logoutWhatsApp(): Promise<void> {
+  isManualLogoutInProgress = true;
+
+  try {
+    if (socket) {
+      try {
+        await socket.logout();
+      } catch {
+        // Ignore socket logout errors and still clear local state.
+      }
+      try {
+        socket.end(new Error("manual logout"));
+      } catch {
+        // Ignore close errors from an already closed socket.
+      }
+    }
+
+    socket = null;
+    reconnectAttempts = 0;
+    waStatus = { status: "disconnected", qrDataUrl: null, account: null };
+
+    await rm("auth_info_baileys", { recursive: true, force: true });
+  } finally {
+    isManualLogoutInProgress = false;
+  }
+}
+
 /**
  * Initialises the WhatsApp connection.
  * Loads the Baileys session from Supabase Storage and auto-reconnects on disconnect.
  * Safe to call multiple times — subsequent calls are no-ops while connected.
  */
 export async function initWhatsApp(): Promise<void> {
+  if (isInitialising) return;
+  if (waStatus.status === "connected" || waStatus.status === "connecting") return;
+  isInitialising = true;
+
+  try {
   // #region agent log
   fetch("http://127.0.0.1:7807/ingest/47cc6123-77ce-4c71-b25f-770fe771b490", {
     method: "POST",
@@ -175,6 +222,12 @@ export async function initWhatsApp(): Promise<void> {
     }
 
     if (connection === "close") {
+      if (isManualLogoutInProgress) {
+        socket = null;
+        waStatus = { status: "disconnected", qrDataUrl: null, account: null };
+        return;
+      }
+
       waStatus = { ...waStatus, status: "reconnecting", qrDataUrl: null, account: null };
 
       const loggedOut = statusCode === DisconnectReason.loggedOut;
@@ -276,4 +329,7 @@ export async function initWhatsApp(): Promise<void> {
       );
     }
   });
+  } finally {
+    isInitialising = false;
+  }
 }
